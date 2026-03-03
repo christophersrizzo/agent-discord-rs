@@ -29,7 +29,7 @@ mod writer_logic;
 
 use auth::AuthManager;
 use commands::agent::{handle_button, ChannelConfig};
-use composer::EmbedComposer;
+use composer::{BlockType, EmbedComposer};
 use config::Config;
 use cron::CronManager;
 use flow::{
@@ -247,17 +247,82 @@ impl Handler {
         let render_assistant_name = assistant_name.clone();
         let render_channel_id = channel_id;
         let render_msg_id = discord_msg.id;
+        let render_agent_type = agent.agent_type().to_string();
+
+        // If the writer drops/loses the final assistant text (common when the broadcast buffer
+        // lags during tool-heavy runs), we can still recover the final text from the Pi session log.
+        async fn recover_last_assistant_text(agent_type: &str, channel_id: u64) -> Option<String> {
+            let agent_type = agent_type.to_string();
+            tokio::task::spawn_blocking(move || {
+                let session_file = crate::migrate::get_sessions_dir(&agent_type)
+                    .join(format!("discord-rs-{}.jsonl", channel_id));
+                let data = std::fs::read_to_string(session_file).ok()?;
+                let mut last_text = None;
+                for line in data.lines() {
+                    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+                    if obj.get("type")?.as_str()? != "message" {
+                        continue;
+                    }
+                    let msg = obj.get("message")?;
+                    if msg.get("role")?.as_str()? != "assistant" {
+                        continue;
+                    }
+                    let content = msg.get("content")?.as_array()?;
+                    let mut text = String::new();
+                    for part in content {
+                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() {
+                        last_text = Some(text);
+                    }
+                }
+                last_text
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+
+        fn split_discord_chunks(s: &str, max: usize) -> Vec<String> {
+            if s.chars().count() <= max {
+                return vec![s.to_string()];
+            }
+            let mut out = Vec::new();
+            let mut start = 0;
+            let chars: Vec<(usize, char)> = s.char_indices().collect();
+            while start < chars.len() {
+                let end = (start + max).min(chars.len());
+                let start_b = chars[start].0;
+                let end_b = if end < chars.len() {
+                    chars[end].0
+                } else {
+                    s.len()
+                };
+                out.push(s[start_b..end_b].to_string());
+                start = end;
+            }
+            out
+        }
 
         let render_task = tokio::spawn(async move {
             let mut last_content = String::new();
             let mut last_status = ExecStatus::Running;
+            let mut last_edit_failed = false;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-                let (current_status, desc) = {
+                let (current_status, desc, has_text_block) = {
                     let c = render_composer.lock().await;
                     let s = render_status.lock().await;
-                    (s.clone(), c.render())
+                    let has_text = c
+                        .blocks
+                        .iter()
+                        .any(|b| b.block_type == BlockType::Text && !b.content.trim().is_empty());
+                    (s.clone(), c.render(), has_text)
                 };
 
                 if desc != last_content || current_status != last_status {
@@ -273,8 +338,10 @@ impl Handler {
                         .edit(&render_http, EditMessage::new().embed(embed))
                         .await
                     {
+                        last_edit_failed = true;
                         error!("❌ Render failed to edit message: {}", e);
                     } else {
+                        last_edit_failed = false;
                         info!(
                             "📢 [EMBED-UPDATE-{}]: status={:?}, len={}",
                             render_channel_id,
@@ -287,6 +354,52 @@ impl Handler {
                 }
 
                 if current_status != ExecStatus::Running {
+                    // Best-effort: ensure we actually show a final answer.
+                    // If our composer doesn't contain any assistant text (only tool calls), recover
+                    // the last assistant text from the session file and post it.
+                    if matches!(current_status, ExecStatus::Success)
+                        && (!has_text_block || last_edit_failed)
+                    {
+                        if let Some(recovered) =
+                            recover_last_assistant_text(&render_agent_type, channel_id_u64).await
+                        {
+                            // Try one last embed edit with the recovered text.
+                            let i18n = render_i18n.read().await;
+                            let (title, color, body) = build_render_view(
+                                &i18n,
+                                &current_status,
+                                &recovered,
+                                &render_assistant_name,
+                            );
+                            let embed = CreateEmbed::new()
+                                .title(title)
+                                .color(color)
+                                .description(body);
+                            let edit_res = render_msg
+                                .edit(&render_http, EditMessage::new().embed(embed))
+                                .await;
+
+                            if edit_res.is_err() {
+                                // Fallback: send as normal messages so it doesn't look like the bot "stopped".
+                                let chunks = split_discord_chunks(&recovered, 1900);
+                                for (i, ch) in chunks.iter().enumerate() {
+                                    let prefix = if chunks.len() > 1 {
+                                        format!("(part {}/{})\n", i + 1, chunks.len())
+                                    } else {
+                                        String::new()
+                                    };
+                                    let _ = render_channel_id
+                                        .send_message(
+                                            &render_http,
+                                            CreateMessage::new()
+                                                .content(format!("{}{}", prefix, ch)),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+
                     let mut should_start_queued = false;
                     // 完工：從活躍任務中移除自己
                     let mut active = render_state.active_renders.lock().await;

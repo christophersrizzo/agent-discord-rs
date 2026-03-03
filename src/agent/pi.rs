@@ -42,7 +42,9 @@ impl PiAgent {
 
         let child_pid = child.id().unwrap_or(0);
         let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
-        let (event_tx, _) = broadcast::channel(1000);
+        // NOTE: tool-heavy runs can generate a lot of small events; a larger buffer
+        // reduces the chance the Discord-side writer lags and drops the final ContentSync.
+        let (event_tx, _) = broadcast::channel(5000);
         let tx = event_tx.clone();
         let pending_trace = Arc::new(Mutex::new(String::new()));
 
