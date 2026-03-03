@@ -308,6 +308,54 @@ impl Handler {
             out
         }
 
+        fn collect_text_blocks(comp: &EmbedComposer) -> String {
+            let mut res = String::new();
+            for block in comp.blocks.iter() {
+                if block.block_type != BlockType::Text {
+                    continue;
+                }
+                let piece = block.content.trim();
+                if piece.is_empty() {
+                    continue;
+                }
+                if !res.is_empty() {
+                    res.push_str("\n\n");
+                }
+                res.push_str(piece);
+            }
+            res
+        }
+
+        async fn send_final_text_chunks(
+            channel_id: serenity::model::id::ChannelId,
+            http: &Arc<serenity::http::Http>,
+            text: &str,
+        ) {
+            let chunks = split_discord_chunks(text, 1900);
+            for (i, ch) in chunks.iter().enumerate() {
+                let prefix = if chunks.len() > 1 {
+                    format!("✅ Final response (part {}/{}):\n", i + 1, chunks.len())
+                } else {
+                    "✅ Final response:\n".to_string()
+                };
+
+                if let Err(e) = channel_id
+                    .send_message(
+                        http,
+                        CreateMessage::new().content(format!("{}{}", prefix, ch)),
+                    )
+                    .await
+                {
+                    error!(
+                        "❌ Failed to send final response chunk {}/{}: {}",
+                        i + 1,
+                        chunks.len(),
+                        e
+                    );
+                }
+            }
+        }
+
         let render_task = tokio::spawn(async move {
             let mut last_content = String::new();
             let mut last_status = ExecStatus::Running;
@@ -315,14 +363,12 @@ impl Handler {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-                let (current_status, desc, has_text_block) = {
+                let (current_status, desc, has_text_block, text_blocks) = {
                     let c = render_composer.lock().await;
                     let s = render_status.lock().await;
-                    let has_text = c
-                        .blocks
-                        .iter()
-                        .any(|b| b.block_type == BlockType::Text && !b.content.trim().is_empty());
-                    (s.clone(), c.render(), has_text)
+                    let text_blocks = collect_text_blocks(&c);
+                    let has_text = !text_blocks.trim().is_empty();
+                    (s.clone(), c.render(), has_text, text_blocks)
                 };
 
                 if desc != last_content || current_status != last_status {
@@ -354,49 +400,59 @@ impl Handler {
                 }
 
                 if current_status != ExecStatus::Running {
-                    // Best-effort: ensure we actually show a final answer.
-                    // If our composer doesn't contain any assistant text (only tool calls), recover
-                    // the last assistant text from the session file and post it.
-                    if matches!(current_status, ExecStatus::Success)
-                        && (!has_text_block || last_edit_failed)
-                    {
-                        if let Some(recovered) =
-                            recover_last_assistant_text(&render_agent_type, channel_id_u64).await
-                        {
-                            // Try one last embed edit with the recovered text.
-                            let i18n = render_i18n.read().await;
-                            let (title, color, body) = build_render_view(
-                                &i18n,
-                                &current_status,
-                                &recovered,
-                                &render_assistant_name,
-                            );
-                            let embed = CreateEmbed::new()
-                                .title(title)
-                                .color(color)
-                                .description(body);
-                            let edit_res = render_msg
-                                .edit(&render_http, EditMessage::new().embed(embed))
-                                .await;
+                    // Phase 1: always send the final assistant text as normal Discord messages
+                    // (chunked), so users can read the full output even when embed content is
+                    // truncated due to tool-heavy runs.
+                    if matches!(current_status, ExecStatus::Success) {
+                        let recovered_text =
+                            recover_last_assistant_text(&render_agent_type, channel_id_u64).await;
 
-                            if edit_res.is_err() {
-                                // Fallback: send as normal messages so it doesn't look like the bot "stopped".
-                                let chunks = split_discord_chunks(&recovered, 1900);
-                                for (i, ch) in chunks.iter().enumerate() {
-                                    let prefix = if chunks.len() > 1 {
-                                        format!("(part {}/{})\n", i + 1, chunks.len())
-                                    } else {
-                                        String::new()
-                                    };
-                                    let _ = render_channel_id
-                                        .send_message(
-                                            &render_http,
-                                            CreateMessage::new()
-                                                .content(format!("{}{}", prefix, ch)),
-                                        )
-                                        .await;
+                        // Keep the existing best-effort embed recovery for cases where the embed
+                        // missed final text or an edit failed.
+                        if (!has_text_block || last_edit_failed)
+                            && recovered_text
+                                .as_ref()
+                                .is_some_and(|t| !t.trim().is_empty())
+                        {
+                            if let Some(recovered) = recovered_text.as_ref() {
+                                let i18n = render_i18n.read().await;
+                                let (title, color, body) = build_render_view(
+                                    &i18n,
+                                    &current_status,
+                                    recovered,
+                                    &render_assistant_name,
+                                );
+                                let embed = CreateEmbed::new()
+                                    .title(title)
+                                    .color(color)
+                                    .description(body);
+                                if let Err(e) = render_msg
+                                    .edit(&render_http, EditMessage::new().embed(embed))
+                                    .await
+                                {
+                                    error!("❌ Final embed recovery edit failed: {}", e);
                                 }
                             }
+                        }
+
+                        // Always post full final text in message chunks.
+                        let final_text =
+                            recovered_text.filter(|t| !t.trim().is_empty()).or_else(|| {
+                                if text_blocks.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(text_blocks.clone())
+                                }
+                            });
+
+                        if let Some(final_text) = final_text {
+                            send_final_text_chunks(render_channel_id, &render_http, &final_text)
+                                .await;
+                        } else {
+                            warn!(
+                                "⚠️ Success status but no final assistant text available to post: channel={}, agent={}",
+                                channel_id_u64, render_agent_type
+                            );
                         }
                     }
 
